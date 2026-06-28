@@ -46,6 +46,8 @@ def assign_leave_for_attendance(attendance_doc, called_from_scheduler=False):
 
     # ── Guard: leave application already exists for this date
     if _leave_application_exists(emp, att_date):
+        # Even if a leave app exists, ensure the Attendance record is linked to it
+        _sync_attendance_with_existing_leave(attendance_doc, emp, att_date)
         _log(emp, att_date, "Skipped", None,
              "Leave Application already exists", attendance_doc.name)
         if called_from_scheduler:
@@ -85,6 +87,12 @@ def assign_leave_for_attendance(attendance_doc, called_from_scheduler=False):
         if called_from_scheduler:
             frappe.db.commit()
 
+        # ── CRITICAL: Update the Attendance record so payroll sees the leave ──
+        _update_attendance_with_leave(attendance_doc, leave_type, leave_app.name, half_day)
+
+        if called_from_scheduler:
+            frappe.db.commit()
+
         _log(emp, att_date, "Assigned", leave_type,
              f"Leave Application {leave_app.name} created automatically",
              attendance_doc.name, leave_app.name, half_day)
@@ -95,11 +103,11 @@ def assign_leave_for_attendance(attendance_doc, called_from_scheduler=False):
     except Exception as e:
         if called_from_scheduler:
             frappe.db.rollback()
-            
+
         # Suppress the error from bubbling up as a UI popup
         if hasattr(frappe.local, 'message_log'):
             frappe.local.message_log = frappe.local.message_log[:initial_log_length]
-            
+
         _log(emp, att_date, "Error", leave_type, str(e), attendance_doc.name)
         frappe.log_error(
             message=frappe.get_traceback(),
@@ -107,6 +115,106 @@ def assign_leave_for_attendance(attendance_doc, called_from_scheduler=False):
         )
         if called_from_scheduler:
             frappe.db.commit()
+
+
+# ─────────────────────────────────────────────
+#  Attendance ↔ Leave Application Sync
+# ─────────────────────────────────────────────
+
+def _update_attendance_with_leave(attendance_doc, leave_type, leave_app_name, half_day):
+    """
+    Update the Attendance record to link it with the Leave Application.
+    This is CRITICAL for payroll — salary_slip reads leave_type from
+    the Attendance record to calculate LWP deductions properly.
+
+    For submitted docs (docstatus=1), we use direct SQL updates to avoid
+    re-triggering validate/submit hooks.
+    """
+    att_name = attendance_doc.name
+
+    if half_day:
+        # For Half Day: keep status as "Half Day", just set leave_type + leave_application
+        frappe.db.sql("""
+            UPDATE `tabAttendance`
+            SET    leave_type = %(leave_type)s,
+                   leave_application = %(leave_app)s
+            WHERE  name = %(att_name)s
+        """, {
+            "leave_type": leave_type,
+            "leave_app":  leave_app_name,
+            "att_name":   att_name,
+        })
+    else:
+        # For full-day Absent: change status to "On Leave" so payroll sees it correctly
+        frappe.db.sql("""
+            UPDATE `tabAttendance`
+            SET    status = 'On Leave',
+                   leave_type = %(leave_type)s,
+                   leave_application = %(leave_app)s
+            WHERE  name = %(att_name)s
+        """, {
+            "leave_type": leave_type,
+            "leave_app":  leave_app_name,
+            "att_name":   att_name,
+        })
+
+
+def _sync_attendance_with_existing_leave(attendance_doc, employee, att_date):
+    """
+    If a Leave Application already exists for this date but the Attendance
+    record is not linked to it, update the Attendance to link them.
+    This handles cases where attendance was imported before leave was applied.
+    """
+    att_name = attendance_doc.name
+
+    # Check if the Attendance already has leave_type set
+    current_leave_type = frappe.db.get_value("Attendance", att_name, "leave_type")
+    if current_leave_type:
+        return  # Already linked, nothing to do
+
+    # Find the matching Leave Application
+    leave_app = frappe.db.get_value(
+        "Leave Application",
+        {
+            "employee":  employee,
+            "from_date": ["<=", att_date],
+            "to_date":   [">=", att_date],
+            "docstatus": 1,
+            "status":    "Approved",
+        },
+        ["name", "leave_type", "half_day", "half_day_date"],
+        as_dict=True,
+    )
+
+    if not leave_app:
+        return
+
+    is_half_day = leave_app.half_day and (leave_app.half_day_date == att_date)
+
+    if is_half_day:
+        frappe.db.sql("""
+            UPDATE `tabAttendance`
+            SET    leave_type = %(leave_type)s,
+                   leave_application = %(leave_app)s,
+                   status = 'Half Day'
+            WHERE  name = %(att_name)s
+        """, {
+            "leave_type": leave_app.leave_type,
+            "leave_app":  leave_app.name,
+            "att_name":   att_name,
+        })
+    else:
+        frappe.db.sql("""
+            UPDATE `tabAttendance`
+            SET    leave_type = %(leave_type)s,
+                   leave_application = %(leave_app)s,
+                   status = 'On Leave'
+            WHERE  name = %(att_name)s
+        """, {
+            "leave_type": leave_app.leave_type,
+            "leave_app":  leave_app.name,
+            "att_name":   att_name,
+        })
 
 
 # ─────────────────────────────────────────────
@@ -170,13 +278,11 @@ def _resolve_leave_type(employee, date, half_day=False):
     Returns (leave_type, balance_available).
     Priority: Casual Leave (if balance >= required) → Leave Without Pay.
 
-    Uses Frappe's get_leave_balance_on if available (HRMS app),
-    otherwise falls back to raw SQL on Leave Allocation.
+    Uses Frappe's get_leave_balance_on if available (HRMS app).
     """
     required_balance = 0.5 if half_day else 1.0
 
     try:
-        # Try the HRMS API first (accurate, handles carry-forward, encashment etc.)
         from hrms.hr.doctype.leave_application.leave_application import (
             get_leave_balance_on,
         )
@@ -185,7 +291,7 @@ def _resolve_leave_type(employee, date, half_day=False):
             return "Casual Leave", True
         else:
             return "Leave Without Pay", False
-            
+
     except Exception as e:
         frappe.log_error(title="Auto Leave Balance Check Failed", message=str(e))
         return "Leave Without Pay", False
@@ -214,3 +320,4 @@ def _log(employee, date, status, leave_type, remarks,
             message=frappe.get_traceback(),
             title=f"Auto Leave Log insert failed — {employee} on {date}"
         )
+

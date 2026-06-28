@@ -110,8 +110,10 @@ def get_leave_log_list(from_date=None, to_date=None, status=None,
 @frappe.whitelist()
 def run_manual_processing(from_date=None, to_date=None):
     """
-    Triggered from the dashboard 'Run Now' button.
+    Triggered from the dashboard 'Run Now' button or after attendance import.
     Processes a date range manually.
+
+    Returns structured counts: {assigned, skipped, errors, ...}
     """
     frappe.only_for(["HR Manager", "System Manager"])
 
@@ -119,11 +121,9 @@ def run_manual_processing(from_date=None, to_date=None):
     to_date   = to_date   or today()
 
     if from_date == to_date:
-        result = process_absent_attendance(from_date)
-        return {"message": result}
+        return process_absent_attendance(from_date)
     else:
-        results = process_date_range(from_date, to_date)
-        return {"message": "\n".join(results)}
+        return process_date_range(from_date, to_date)
 
 
 @frappe.whitelist()
