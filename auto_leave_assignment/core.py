@@ -57,9 +57,10 @@ def assign_leave_for_attendance(attendance_doc, called_from_scheduler=False):
         return
 
     # ── Determine leave type
-    leave_type, balance_available = _resolve_leave_type(emp, att_date)
+    leave_type, balance_available = _resolve_leave_type(emp, att_date, half_day)
 
     # ── Create and submit Leave Application
+    initial_log_length = len(frappe.local.message_log) if hasattr(frappe.local, 'message_log') else 0
     try:
         leave_app = frappe.get_doc({
             "doctype":     "Leave Application",
@@ -94,6 +95,11 @@ def assign_leave_for_attendance(attendance_doc, called_from_scheduler=False):
     except Exception as e:
         if called_from_scheduler:
             frappe.db.rollback()
+            
+        # Suppress the error from bubbling up as a UI popup
+        if hasattr(frappe.local, 'message_log'):
+            frappe.local.message_log = frappe.local.message_log[:initial_log_length]
+            
         _log(emp, att_date, "Error", leave_type, str(e), attendance_doc.name)
         frappe.log_error(
             message=frappe.get_traceback(),
@@ -159,51 +165,30 @@ def _get_leave_approver(employee):
     return leave_approver
 
 
-def _resolve_leave_type(employee, date):
+def _resolve_leave_type(employee, date, half_day=False):
     """
     Returns (leave_type, balance_available).
-    Priority: Casual Leave (if balance > 0) → Leave Without Pay.
+    Priority: Casual Leave (if balance >= required) → Leave Without Pay.
 
     Uses Frappe's get_leave_balance_on if available (HRMS app),
     otherwise falls back to raw SQL on Leave Allocation.
     """
+    required_balance = 0.5 if half_day else 1.0
+
     try:
         # Try the HRMS API first (accurate, handles carry-forward, encashment etc.)
         from hrms.hr.doctype.leave_application.leave_application import (
             get_leave_balance_on,
         )
         balance = get_leave_balance_on(employee, "Casual Leave", date)
-        if balance and balance > 0:
+        if balance is not None and balance >= required_balance:
             return "Casual Leave", True
-    except (ImportError, ModuleNotFoundError):
-        # HRMS app not installed — fall back to raw allocation query
-        pass
-    except Exception:
-        # Any other error from get_leave_balance_on — fall back
-        pass
-
-    # Fallback: direct allocation query
-    allocation = frappe.db.sql("""
-        SELECT
-            total_leaves_allocated,
-            total_leaves_taken
-        FROM `tabLeave Allocation`
-        WHERE
-            employee      = %(employee)s
-            AND leave_type = 'Casual Leave'
-            AND docstatus  = 1
-            AND from_date  <= %(date)s
-            AND to_date    >= %(date)s
-        ORDER BY to_date DESC
-        LIMIT 1
-    """, {"employee": employee, "date": date}, as_dict=True)
-
-    if allocation:
-        remaining = (allocation[0].total_leaves_allocated or 0) - (allocation[0].total_leaves_taken or 0)
-        if remaining > 0:
-            return "Casual Leave", True
-
-    return "Leave Without Pay", False
+        else:
+            return "Leave Without Pay", False
+            
+    except Exception as e:
+        frappe.log_error(title="Auto Leave Balance Check Failed", message=str(e))
+        return "Leave Without Pay", False
 
 
 def _log(employee, date, status, leave_type, remarks,
