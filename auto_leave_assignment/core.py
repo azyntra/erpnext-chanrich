@@ -63,11 +63,13 @@ def assign_leave_for_attendance(attendance_doc, called_from_scheduler=False):
 
     # ── Create and submit Leave Application
     initial_log_length = len(frappe.local.message_log) if hasattr(frappe.local, 'message_log') else 0
-    try:
-        leave_app = frappe.get_doc({
+
+    def _try_create_leave(lt, description_suffix):
+        """Attempt to create a Leave Application of given type. Returns doc or raises."""
+        la = frappe.get_doc({
             "doctype":     "Leave Application",
             "employee":    emp,
-            "leave_type":  leave_type,
+            "leave_type":  lt,
             "from_date":   att_date,
             "to_date":     att_date,
             "half_day":    1 if half_day else 0,
@@ -77,12 +79,46 @@ def assign_leave_for_attendance(attendance_doc, called_from_scheduler=False):
             "description": (
                 f"Auto-assigned by Auto Leave Assignment app. "
                 f"Source Attendance: {attendance_doc.name}. "
-                f"{'Casual Leave balance available.' if balance_available else 'No Casual Leave balance — LWP applied.'}"
+                f"{description_suffix}"
             ),
         })
-        leave_app.flags.ignore_permissions = True
-        leave_app.insert()
-        leave_app.submit()
+        la.flags.ignore_permissions = True
+        la.insert()
+        la.submit()
+        return la
+
+    try:
+        leave_app = None
+
+        # First attempt: try the resolved leave type
+        try:
+            leave_app = _try_create_leave(
+                leave_type,
+                "Casual Leave balance available." if balance_available else "No Casual Leave balance — LWP applied."
+            )
+        except Exception as first_err:
+            # If Casual Leave failed (e.g. insufficient balance race condition),
+            # retry with Leave Without Pay
+            err_str = str(first_err).lower()
+            if leave_type == "Casual Leave" and ("insufficient" in err_str or "balance" in err_str):
+                # Suppress any messages from the failed attempt
+                if hasattr(frappe.local, 'message_log'):
+                    frappe.local.message_log = frappe.local.message_log[:initial_log_length]
+                # Clear _server_messages to prevent the red popup
+                if hasattr(frappe.local, '_server_messages'):
+                    frappe.local._server_messages = []
+
+                if called_from_scheduler:
+                    frappe.db.rollback()
+
+                leave_type = "Leave Without Pay"
+                balance_available = False
+                leave_app = _try_create_leave(
+                    "Leave Without Pay",
+                    "Casual Leave failed (insufficient balance) — LWP applied as fallback."
+                )
+            else:
+                raise  # Re-raise non-balance errors
 
         if called_from_scheduler:
             frappe.db.commit()
@@ -104,10 +140,6 @@ def assign_leave_for_attendance(attendance_doc, called_from_scheduler=False):
         if called_from_scheduler:
             frappe.db.rollback()
 
-        # Suppress the error from bubbling up as a UI popup
-        if hasattr(frappe.local, 'message_log'):
-            frappe.local.message_log = frappe.local.message_log[:initial_log_length]
-
         _log(emp, att_date, "Error", leave_type, str(e), attendance_doc.name)
         frappe.log_error(
             message=frappe.get_traceback(),
@@ -115,6 +147,10 @@ def assign_leave_for_attendance(attendance_doc, called_from_scheduler=False):
         )
         if called_from_scheduler:
             frappe.db.commit()
+
+    # Always suppress accumulated popups from leave creation
+    if hasattr(frappe.local, 'message_log'):
+        frappe.local.message_log = frappe.local.message_log[:initial_log_length]
 
 
 # ─────────────────────────────────────────────
